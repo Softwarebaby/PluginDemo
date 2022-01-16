@@ -1,0 +1,155 @@
+什么是热修复？
+定义：在我们应用上线后出现bug需要及时修复时，不用再发新的安装包，只需要发布补丁包，在用户感知的情况下修复该bug
+
+怎么进行热修复？
+服务端：补丁包管理
+用户端：执行热修复
+开发端：生成补丁包
+
+插件化技术起初源于免安装运行apk的想法，这个免安装apk就可以理解为插件，而支持插件的app我们一般叫宿主
+
+插件化解决的问题：
+1）APP的功能模块越来越多，体积越来越大
+2）模块之间的耦合度高，协同开发沟通成本越来越大
+3）方法数目可能超过65535，APP占用的内存过大
+4）应用之间的互相调用
+
+组件化开发是将一个APP分成多个模块，每个模块就是一个组件，开发过程中我们可以让这些组件单独依赖或者单独调试部分
+组件等，但是最终发布的时候是将这些组件合并统一成一个apk，这就是组件化开发。
+
+插件化开发是将整个APP拆分成多个模块，这些模块包括一个宿主和多个插件，每个模块都是一个apk，最终打包的时候宿主apk
+和插件apk分开打包。
+
+VirtualAPK（滴滴）
+支持四大组件；组件无需在宿主manifest中预注册；插件可以依赖宿主；支持PendingIntent；几乎支持全部android特性；
+兼容性适配程度高；采用Gradle插件构建
+
+DroidPlugin（360）！！！
+支持四大组件；组件无需在宿主manifest中预注册；支持PendingIntent；几乎支持全部android特性；兼容性适配程度高；
+
+插件化实现思路：
+1）如何加载插件的类？
+2）如何启动插件的四大组件？
+3）如何加载插件的资源？
+
+面试题
+类是如何加载的？
+在加载阶段，虚拟机主要完成三件事：
+1）通过一个类的全限定名来获取定义此类的二进制字节流；
+2）将这个字节流所代表的静态数据结构转化成方法区域的运行时数据结构；
+3）在Java堆中生成一个代表这个类的Class对象，作为方法区域的数据结构的访问入口
+
+反射
+Class -> Class类的对象 -> API -> Method、Field
+
+类加载器
+DexClassLoader（自定义） -> PathClassLoader -> BootClassLoader
+
+应用（如：MainActivity）-- PathClassLoader (parent: BootClassLoader)
+Android SDK -- BootClassLoader
+
+// 加载一个自定义的类
+DexClassLoader dexClassLoader = new DexClassLoader(dexPath, getCacheDir().getAbsolutePath(),
+                                null, getClassLoader()); //parent ClassLoader一般传入PathClassLoader
+Class<?> clazz = dexClassLoader.loadClass("com.xx.xx.test");
+
+双亲委派机制：
+首先检测这个类是否已经被加载了，如果已经加载了，直接获取并返回。如果没有被加载，parent不为null，则调用parent
+的loadClass进行加载，依次递归，如果找到了或者加载了就返回，如果既没有找到又加载不了，才自己去加载。
+优点：
+1）避免重复加载，当父加载器已经加载了该类的时候，就没有必要子ClassLoader再加载一次了
+2）安全性考虑，防止核心API库被随意篡改
+
+我们加载一个自定义的类，让它替换系统的String类，可以吗？
+不可以，双亲委派机制会优先使用已经加载过的系统的String类
+
+findClass:
+BaseClassLoader.findClass -> DexPathList.findClass（for循环dexElements - Element[]：遍历多个dex文件）
+-> Element.findClass -> DexFile.loadClassBinaryName(DexFile：dex文件)
+
+如何把插件的dex文件放在宿主的dex文件中？
+所有的dex文件都在宿主的dexElements数组中，只需要将插件的dexElements放到宿主的dexElements中即可（反射）
+步骤：
+1）宿主的dexElements
+2）插件的dexElements
+3）合并宿主的dexElements和插件的dexElements
+4）将合并的dexElements赋值到宿主的dexElements中
+
+dexElements <- dexElements的Field <- DexPathList对象 <- PathList的Field <- BaseDexClassLoader对象
+<= 宿主和插件的类加载器
+
+HooK：改变代码的正常的执行流程
+实现Hook的技术：反射和动态代理
+查找Hook点的原则：
+1）尽量静态变量或者单例对象
+2）尽量Hook public的对象和方法
+
+两次Hook：
+PluginActivity -> ProxyActivity（绕过AMS检测）
+ProxyActivity -> PluginActivity
+
+startActivity Hook点：
+PluginActivity -> ProxyActivity
+1. 动态代理IActivityManager.startActivity方法，替换Intent得到代理的IActivityManager对象
+Activity.startActivityForResult -> mInstrumentation.execStartActivity
+ -> ActivityManager.getService.startActivity
+(ActivityManager.getService 返回：IActivityManager；
+IActivityManager.startActivity 参数：Intent)
+其中：动态代理method.invoke的第一个参数需要传入系统的IActivityManager对象
+
+如何拿到系统的IActivityManager对象？
+IActivityManager <- IActivityManagerSingleton(--Singleton).get(返回：mInstance)
+目标：mInstance -> mInstance的Filed（调用set方法还需要传入Singleton对象--静态）
+
+2. 用代理IActivityManager对象替换系统的IActivityManager对象
+
+ProxyActivity -> PluginActivity
+寻找Intent的方法
+ActivityClientRecord.intent <- 获取ActivityClientRecord的对象 <- msg.obj
+
+如何获取msg?
+Handler.Callback -> 创建一个Callback对象，替换系统的Callback -> Callback.msg -> handleMessage(msg)
+
+如何获取系统的Callback对象
+系统Callback对象 -> mh对象 -> ActivityThread对象 -> sCurrentActivityThread
+
+面试题：
+简述Activity的启动流程：
+Activity的启动过程，我们可以从Context的startActivity说起，其实现是ContextImpl的startActivity，然后
+内部会通过Instruction来尝试启动Activity，它会调用ams的startActivity方法，这是一个跨进程过程，当ams校验完
+activity的合法性后，会通过ApplicationThread回调我们的进程，这也是一个跨进程的过程，而applicationTread
+就是一个binder，回调逻辑是在binder线程池中完成的，所以需要通过Handler H将其切换到UI线程。第一个消息是
+LAUNCH_ACTIVITY，它对应handleLaunchActivity，在这个方法里完成了Activity的创建和启动。
+
+
+资源加载
+assets文件夹：getAssets()
+res文件夹：getResources()
+实际上，getResources()也是通过AssetManager类去访问被编译过的应用程序资源文件，不过在访问之前，它会先根据
+资源ID查找到对应的资源文件名。而AssetManager对象既可以通过文件名访问那些编译过的，也可以访问没有被编译过的
+应用程序资源文件。
+
+面试题：
+raw文件夹和assets文件夹有什么区别
+raw：Android会自动为这个目录中的所有资源文件生成一个ID，这意味着很容易就可以访问这些资源，甚至在xml中可以
+直接访问，使用ID访问的速度是最快的；
+assets：不会生成ID，只能通过AssetManager访问，xml不能访问，访问速度会慢些，不过操作更加方便。
+
+Context：ApplicationContext、Activity Context
+
+Activity -> Context -> Resources -> AssertManager
+Activity Context创建：
+ActivityThread.createBaseContextForActivity -> ContextImpl.createActivityContext
+-> 通过ContextImpl的构造方法构建，并且通过setResource绑定资源
+资源创建：
+ResourceManager：createBaseActivityResource -- 需要构建ResourceKey -- resDir资源目录
+-> getOrCreateResources -> createResourceImpl -> new ResourceImpl -- assets: AssetManager
+AssetManager创建：
+ResourceManager：createAssetManager -> addAssetPath(将资源放到assetManager中，Hook点)
+-- 传入参数key.mResDir（宿主的资源改为插件的资源）
+方案：
+添加：再创建一个AssetManager，专门加载插件资源，不会有冲突（更优！）
+合并：插件+宿主资源，会有冲突，AAPT处理
+
+Activity => AppcompatActivity
+冲突？如果宿主的资源ID和插件的资源ID冲突，会优先用宿主的 解决方法：替换Context
